@@ -1,10 +1,14 @@
-// server/src/app.js
+
+import 'dotenv/config'
+
 import express from 'express'
+import mongoose from 'mongoose'
 import cors from 'cors'
 import helmet from 'helmet'
 import morgan from 'morgan'
 import bcrypt from 'bcryptjs'
 import jwt from 'jsonwebtoken'
+
 import {
   User,
   Attendance,
@@ -16,13 +20,36 @@ import {
 
 const app = express()
 
-app.use(helmet())
-app.use(cors({
-  origin: process.env.CLIENT_ORIGIN || true,
-  credentials: true,
-}))
+const PORT = process.env.PORT || 5000
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+
+app.use(
+  helmet({
+    crossOriginResourcePolicy: {
+      policy: 'cross-origin',
+    },
+  })
+)
+
+app.use(
+  cors({
+    origin: process.env.CLIENT_ORIGIN || 'http://localhost:5175',
+    credentials: true,
+    methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization'],
+  })
+)
+
 app.use(express.json({ limit: '1mb' }))
+app.use(express.urlencoded({ extended: true }))
 app.use(morgan('dev'))
+
+// ==========================================
+// HELPER FUNCTIONS
+// ==========================================
 
 function safeUser(user) {
   return {
@@ -41,48 +68,13 @@ function createToken(user) {
   }
 
   return jwt.sign(
-    { sub: String(user._id), role: user.role },
+    {
+      sub: String(user._id),
+      role: user.role,
+    },
     process.env.JWT_SECRET,
     { expiresIn: '8h' }
   )
-}
-
-async function auth(req, res, next) {
-  try {
-    const authorization = req.headers.authorization || ''
-
-    if (!authorization.startsWith('Bearer ')) {
-      return res.status(401).json({ message: 'Please sign in first' })
-    }
-
-    const payload = jwt.verify(
-      authorization.slice(7),
-      process.env.JWT_SECRET
-    )
-    const user = await User.findById(payload.sub)
-
-    if (!user || user.active === false) {
-      return res.status(401).json({ message: 'Account is unavailable' })
-    }
-
-    req.user = user
-    next()
-  } catch {
-    return res.status(401).json({
-      message: 'Invalid or expired login session',
-    })
-  }
-}
-
-function allow(...roles) {
-  return (req, res, next) => {
-    if (!roles.includes(req.user.role)) {
-      return res.status(403).json({
-        message: 'You do not have permission to perform this action',
-      })
-    }
-    next()
-  }
 }
 
 function handleError(res, error, status = 500) {
@@ -94,19 +86,109 @@ function handleError(res, error, status = 500) {
     })
   }
 
+  if (
+    error?.name === 'ValidationError' ||
+    error?.name === 'CastError'
+  ) {
+    return res.status(400).json({
+      message: error.message,
+    })
+  }
+
   return res.status(status).json({
-    message: status === 500
+    message: status >= 500
       ? 'An unexpected server error occurred'
       : error.message,
   })
 }
+
+function validateDateRange(startDate, endDate) {
+  const start = new Date(startDate)
+  const end = new Date(endDate)
+
+  if (
+    !startDate ||
+    !endDate ||
+    Number.isNaN(start.getTime()) ||
+    Number.isNaN(end.getTime()) ||
+    end < start
+  ) {
+    return null
+  }
+
+  return { start, end }
+}
+
+// ==========================================
+// AUTHENTICATION MIDDLEWARE
+// ==========================================
+
+async function auth(req, res, next) {
+  try {
+    if (!process.env.JWT_SECRET) {
+      return res.status(500).json({
+        message: 'Server authentication is not configured',
+      })
+    }
+
+    const authorization = req.headers.authorization || ''
+
+    if (!authorization.startsWith('Bearer ')) {
+      return res.status(401).json({
+        message: 'Please sign in first',
+      })
+    }
+
+    const payload = jwt.verify(
+      authorization.slice(7),
+      process.env.JWT_SECRET
+    )
+
+    const user = await User.findById(payload.sub)
+
+    if (!user || user.active === false) {
+      return res.status(401).json({
+        message: 'Account is unavailable',
+      })
+    }
+
+    req.user = user
+    next()
+  } catch {
+    return res.status(401).json({
+      message: 'Invalid or expired login session',
+    })
+  }
+}
+
+// ==========================================
+// ROLE PERMISSIONS
+// ==========================================
+
+function allow(...roles) {
+  return (req, res, next) => {
+    if (!req.user || !roles.includes(req.user.role)) {
+      return res.status(403).json({
+        message: 'You do not have permission to perform this action',
+      })
+    }
+
+    next()
+  }
+}
+
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
 
 async function notifyUsers(
   userIds,
   { title, message, type = 'system' }
 ) {
   const uniqueIds = [
-    ...new Set((userIds || []).filter(Boolean).map(String)),
+    ...new Set(
+      (userIds || []).filter(Boolean).map(String)
+    ),
   ]
 
   if (!uniqueIds.length) return
@@ -118,12 +200,17 @@ async function notifyUsers(
         title,
         message,
         type,
-      }))
+      })),
+      { ordered: false }
     )
   } catch (error) {
     console.error('Notification creation failed:', error.message)
   }
 }
+
+// ==========================================
+// HEALTH CHECK
+// ==========================================
 
 app.get('/api/health', (_req, res) => {
   res.json({
@@ -133,15 +220,27 @@ app.get('/api/health', (_req, res) => {
   })
 })
 
-// Authentication
+// ==========================================
+// AUTHENTICATION ROUTES
+// ==========================================
+
+// REGISTER
 app.post('/api/auth/register', async (req, res) => {
   try {
-    const { name, email, password, department = 'General' } = req.body
+    const {
+      name,
+      email,
+      password,
+      department = 'General',
+    } = req.body || {}
 
     if (
-      typeof name !== 'string' || !name.trim() ||
-      typeof email !== 'string' || !email.trim() ||
-      typeof password !== 'string' || password.length < 8
+      typeof name !== 'string' ||
+      !name.trim() ||
+      typeof email !== 'string' ||
+      !email.trim() ||
+      typeof password !== 'string' ||
+      password.length < 8
     ) {
       return res.status(400).json({
         message: 'Name, email and password (at least 8 characters) are required',
@@ -150,7 +249,11 @@ app.post('/api/auth/register', async (req, res) => {
 
     const normalizedEmail = email.toLowerCase().trim()
 
-    if (await User.findOne({ email: normalizedEmail })) {
+    const existingUser = await User.findOne({
+      email: normalizedEmail,
+    })
+
+    if (existingUser) {
       return res.status(409).json({
         message: 'An account with this email already exists',
       })
@@ -161,24 +264,29 @@ app.post('/api/auth/register', async (req, res) => {
       email: normalizedEmail,
       passwordHash: await bcrypt.hash(password, 12),
       role: 'employee',
-      department: typeof department === 'string' && department.trim()
-        ? department.trim()
-        : 'General',
+      department:
+        typeof department === 'string' && department.trim()
+          ? department.trim()
+          : 'General',
     })
 
-    return res.status(201).json({
+    res.status(201).json({
       token: createToken(user),
       user: safeUser(user),
     })
   } catch (error) {
-    return handleError(res, error, 400)
+    handleError(res, error)
   }
 })
 
+// LOGIN
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const email = String(req.body.email || '').toLowerCase().trim()
-    const password = req.body.password
+    const email = String(
+      req.body?.email || ''
+    ).toLowerCase().trim()
+
+    const password = req.body?.password
 
     if (!email || typeof password !== 'string') {
       return res.status(400).json({
@@ -186,7 +294,9 @@ app.post('/api/auth/login', async (req, res) => {
       })
     }
 
-    const user = await User.findOne({ email }).select('+passwordHash')
+    const user = await User.findOne({
+      email,
+    }).select('+passwordHash')
 
     if (
       !user ||
@@ -198,28 +308,42 @@ app.post('/api/auth/login', async (req, res) => {
       })
     }
 
-    res.json({ token: createToken(user), user: safeUser(user) })
+    res.json({
+      token: createToken(user),
+      user: safeUser(user),
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
+// CURRENT USER
 app.get('/api/auth/me', auth, (req, res) => {
-  res.json({ user: safeUser(req.user) })
+  res.json({
+    user: safeUser(req.user),
+  })
 })
 
-// Employees — HR only
+// ==========================================
+// EMPLOYEE MANAGEMENT
+// ==========================================
+
+// GET EMPLOYEES
 app.get('/api/employees', auth, allow('hr'), async (_req, res) => {
   try {
-    const employees = await User.find({ active: { $ne: false } })
-      .sort({ createdAt: -1 })
+    const employees = await User.find({
+      active: { $ne: false },
+    }).sort({ createdAt: -1 })
 
-    res.json({ employees: employees.map(safeUser) })
+    res.json({
+      employees: employees.map(safeUser),
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
+// CREATE EMPLOYEE
 app.post('/api/employees', auth, allow('hr'), async (req, res) => {
   try {
     const {
@@ -229,12 +353,15 @@ app.post('/api/employees', auth, allow('hr'), async (req, res) => {
       role = 'employee',
       department = 'General',
       managerId = null,
-    } = req.body
+    } = req.body || {}
 
     if (
-      typeof name !== 'string' || !name.trim() ||
-      typeof email !== 'string' || !email.trim() ||
-      typeof password !== 'string' || password.length < 8
+      typeof name !== 'string' ||
+      !name.trim() ||
+      typeof email !== 'string' ||
+      !email.trim() ||
+      typeof password !== 'string' ||
+      password.length < 8
     ) {
       return res.status(400).json({
         message: 'Name, email and password (at least 8 characters) are required',
@@ -242,13 +369,17 @@ app.post('/api/employees', auth, allow('hr'), async (req, res) => {
     }
 
     if (!['hr', 'manager', 'employee'].includes(role)) {
-      return res.status(400).json({ message: 'Invalid role' })
+      return res.status(400).json({
+        message: 'Invalid role',
+      })
     }
 
     const normalizedEmail = email.toLowerCase().trim()
 
     if (await User.findOne({ email: normalizedEmail })) {
-      return res.status(409).json({ message: 'Email already exists' })
+      return res.status(409).json({
+        message: 'Email already exists',
+      })
     }
 
     if (managerId) {
@@ -270,47 +401,100 @@ app.post('/api/employees', auth, allow('hr'), async (req, res) => {
       email: normalizedEmail,
       passwordHash: await bcrypt.hash(password, 12),
       role,
-      department: department.trim() || 'General',
+      department:
+        typeof department === 'string' && department.trim()
+          ? department.trim()
+          : 'General',
       managerId: managerId || null,
     })
 
-    res.status(201).json({ employee: safeUser(employee) })
+    res.status(201).json({
+      employee: safeUser(employee),
+    })
   } catch (error) {
-    handleError(res, error, 400)
+    handleError(res, error)
   }
 })
 
+// UPDATE EMPLOYEE
 app.patch('/api/employees/:id', auth, allow('hr'), async (req, res) => {
   try {
-    const allowedFields = ['name', 'department', 'role', 'managerId', 'active']
+    const allowedFields = [
+      'name',
+      'department',
+      'role',
+      'managerId',
+      'active',
+    ]
+
     const updates = Object.fromEntries(
-      Object.entries(req.body).filter(([key]) =>
-        allowedFields.includes(key)
+      Object.entries(req.body || {}).filter(
+        ([key]) => allowedFields.includes(key)
       )
     )
 
-    if (updates.role && !['hr', 'manager', 'employee'].includes(updates.role)) {
-      return res.status(400).json({ message: 'Invalid role' })
+    if (!Object.keys(updates).length) {
+      return res.status(400).json({
+        message: 'No valid fields provided for update',
+      })
+    }
+
+    if (
+      updates.role !== undefined &&
+      !['hr', 'manager', 'employee'].includes(updates.role)
+    ) {
+      return res.status(400).json({
+        message: 'Invalid role',
+      })
     }
 
     if (updates.name !== undefined) {
       if (typeof updates.name !== 'string' || !updates.name.trim()) {
-        return res.status(400).json({ message: 'Name cannot be empty' })
+        return res.status(400).json({
+          message: 'Name cannot be empty',
+        })
       }
+
       updates.name = updates.name.trim()
     }
 
-    if (updates.managerId) {
-      const manager = await User.findOne({
-        _id: updates.managerId,
-        role: 'manager',
-        active: { $ne: false },
-      })
-
-      if (!manager) {
+    if (updates.department !== undefined) {
+      if (
+        typeof updates.department !== 'string' ||
+        !updates.department.trim()
+      ) {
         return res.status(400).json({
-          message: 'Manager not found or inactive',
+          message: 'Department cannot be empty',
         })
+      }
+
+      updates.department = updates.department.trim()
+    }
+
+    if (
+      updates.active !== undefined &&
+      typeof updates.active !== 'boolean'
+    ) {
+      return res.status(400).json({
+        message: 'Active must be true or false',
+      })
+    }
+
+    if (Object.hasOwn(updates, 'managerId')) {
+      if (!updates.managerId) {
+        updates.managerId = null
+      } else {
+        const manager = await User.findOne({
+          _id: updates.managerId,
+          role: 'manager',
+          active: { $ne: false },
+        })
+
+        if (!manager) {
+          return res.status(400).json({
+            message: 'Manager not found or inactive',
+          })
+        }
       }
     }
 
@@ -321,21 +505,30 @@ app.patch('/api/employees/:id', auth, allow('hr'), async (req, res) => {
     )
 
     if (!employee) {
-      return res.status(404).json({ message: 'Employee not found' })
+      return res.status(404).json({
+        message: 'Employee not found',
+      })
     }
 
-    res.json({ employee: safeUser(employee) })
+    res.json({
+      employee: safeUser(employee),
+    })
   } catch (error) {
-    handleError(res, error, 400)
+    handleError(res, error)
   }
 })
 
-// Attendance
+// ==========================================
+// ATTENDANCE
+// ==========================================
+
+// GET ATTENDANCE
 app.get('/api/attendance', auth, async (req, res) => {
   try {
-    const query = req.user.role === 'hr'
-      ? {}
-      : { userId: req.user._id }
+    const query =
+      req.user.role === 'hr'
+        ? {}
+        : { userId: req.user._id }
 
     const attendance = await Attendance.find(query)
       .populate('userId', 'name email department')
@@ -348,9 +541,11 @@ app.get('/api/attendance', auth, async (req, res) => {
   }
 })
 
+// CHECK IN
 app.post('/api/attendance/check-in', auth, async (req, res) => {
   try {
     const workDate = new Date().toISOString().slice(0, 10)
+
     let record = await Attendance.findOne({
       userId: req.user._id,
       workDate,
@@ -379,15 +574,20 @@ app.post('/api/attendance/check-in', auth, async (req, res) => {
       await record.save()
     }
 
-    res.json({ message: 'Checked in successfully', attendance: record })
+    res.json({
+      message: 'Checked in successfully',
+      attendance: record,
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
+// CHECK OUT
 app.post('/api/attendance/check-out', auth, async (req, res) => {
   try {
     const workDate = new Date().toISOString().slice(0, 10)
+
     const record = await Attendance.findOne({
       userId: req.user._id,
       workDate,
@@ -408,13 +608,20 @@ app.post('/api/attendance/check-out', auth, async (req, res) => {
     record.checkOut = new Date()
     await record.save()
 
-    res.json({ message: 'Checked out successfully', attendance: record })
+    res.json({
+      message: 'Checked out successfully',
+      attendance: record,
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
-// Leave requests
+// ==========================================
+// LEAVE REQUESTS
+// ==========================================
+
+// GET LEAVES
 app.get('/api/leaves', auth, async (req, res) => {
   try {
     let query = {}
@@ -424,10 +631,13 @@ app.get('/api/leaves', auth, async (req, res) => {
     } else if (req.user.role === 'manager') {
       const team = await User.find({
         managerId: req.user._id,
+        active: { $ne: false },
       }).select('_id')
 
       query = {
-        userId: { $in: team.map(item => item._id) },
+        userId: {
+          $in: team.map(item => item._id),
+        },
       }
     }
 
@@ -442,19 +652,14 @@ app.get('/api/leaves', auth, async (req, res) => {
   }
 })
 
+// CREATE LEAVE
 app.post('/api/leaves', auth, async (req, res) => {
   try {
-    const { startDate, endDate, reason } = req.body
-    const start = new Date(startDate)
-    const end = new Date(endDate)
+    const { startDate, endDate, reason } = req.body || {}
 
-    if (
-      !startDate || !endDate ||
-      Number.isNaN(start.getTime()) ||
-      Number.isNaN(end.getTime()) ||
-      end < start ||
-      typeof reason !== 'string' || !reason.trim()
-    ) {
+    const dates = validateDateRange(startDate, endDate)
+
+    if (!dates || typeof reason !== 'string' || !reason.trim()) {
       return res.status(400).json({
         message: 'Provide valid dates and a reason; end date must not precede start date',
       })
@@ -462,24 +667,28 @@ app.post('/api/leaves', auth, async (req, res) => {
 
     const leave = await LeaveRequest.create({
       userId: req.user._id,
-      startDate: start,
-      endDate: end,
+      startDate: dates.start,
+      endDate: dates.end,
       reason: reason.trim(),
     })
 
-    res.status(201).json({ message: 'Leave request submitted', leave })
+    res.status(201).json({
+      message: 'Leave request submitted',
+      leave,
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
+// APPROVE OR REJECT LEAVE
 app.patch(
   '/api/leaves/:id/decision',
   auth,
   allow('hr', 'manager'),
   async (req, res) => {
     try {
-      const { status, reviewNote = '' } = req.body
+      const { status, reviewNote = '' } = req.body || {}
 
       if (!['approved', 'rejected'].includes(status)) {
         return res.status(400).json({
@@ -487,10 +696,18 @@ app.patch(
         })
       }
 
+      if (typeof reviewNote !== 'string') {
+        return res.status(400).json({
+          message: 'Review note must be a string',
+        })
+      }
+
       const leave = await LeaveRequest.findById(req.params.id)
 
       if (!leave) {
-        return res.status(404).json({ message: 'Leave request not found' })
+        return res.status(404).json({
+          message: 'Leave request not found',
+        })
       }
 
       if (leave.status !== 'pending') {
@@ -513,8 +730,9 @@ app.patch(
       }
 
       leave.status = status
-      leave.reviewNote = String(reviewNote).slice(0, 500)
+      leave.reviewNote = reviewNote.slice(0, 500)
       leave.reviewerId = req.user._id
+
       await leave.save()
 
       await notifyUsers([leave.userId], {
@@ -523,14 +741,21 @@ app.patch(
         type: 'leave',
       })
 
-      res.json({ message: `Leave ${status}`, leave })
+      res.json({
+        message: `Leave ${status}`,
+        leave,
+      })
     } catch (error) {
       handleError(res, error)
     }
   }
 )
 
-// Announcements
+// ==========================================
+// ANNOUNCEMENTS
+// ==========================================
+
+// GET ANNOUNCEMENTS
 app.get('/api/announcements', auth, async (_req, res) => {
   try {
     const announcements = await Announcement.find()
@@ -544,13 +769,16 @@ app.get('/api/announcements', auth, async (_req, res) => {
   }
 })
 
+// CREATE ANNOUNCEMENT
 app.post('/api/announcements', auth, allow('hr'), async (req, res) => {
   try {
-    const { title, body } = req.body
+    const { title, body } = req.body || {}
 
     if (
-      typeof title !== 'string' || !title.trim() ||
-      typeof body !== 'string' || !body.trim()
+      typeof title !== 'string' ||
+      !title.trim() ||
+      typeof body !== 'string' ||
+      !body.trim()
     ) {
       return res.status(400).json({
         message: 'Title and announcement content are required',
@@ -564,7 +792,7 @@ app.post('/api/announcements', auth, allow('hr'), async (req, res) => {
     })
 
     const recipients = await User.find({
-      active: true,
+      active: { $ne: false },
       _id: { $ne: req.user._id },
     }).select('_id')
 
@@ -583,7 +811,11 @@ app.post('/api/announcements', auth, allow('hr'), async (req, res) => {
   }
 })
 
-// Training
+// ==========================================
+// TRAINING
+// ==========================================
+
+// GET TRAININGS
 app.get('/api/trainings', auth, async (_req, res) => {
   try {
     const trainings = await Training.find()
@@ -597,6 +829,7 @@ app.get('/api/trainings', auth, async (_req, res) => {
   }
 })
 
+// CREATE TRAINING
 app.post('/api/trainings', auth, allow('hr'), async (req, res) => {
   try {
     const {
@@ -605,37 +838,41 @@ app.post('/api/trainings', auth, allow('hr'), async (req, res) => {
       trainer = '',
       startDate,
       endDate,
-    } = req.body
+    } = req.body || {}
 
     if (
-      typeof title !== 'string' || !title.trim() ||
-      typeof description !== 'string' || !description.trim() ||
-      !startDate || !endDate
+      typeof title !== 'string' ||
+      !title.trim() ||
+      typeof description !== 'string' ||
+      !description.trim() ||
+      !startDate ||
+      !endDate
     ) {
       return res.status(400).json({
         message: 'Title, description, start date and end date are required',
       })
     }
 
-    const start = new Date(startDate)
-    const end = new Date(endDate)
+    const dates = validateDateRange(startDate, endDate)
 
-    if (
-      Number.isNaN(start.getTime()) ||
-      Number.isNaN(end.getTime()) ||
-      end < start
-    ) {
+    if (!dates) {
       return res.status(400).json({
         message: 'Please provide valid dates; end date must not precede start date',
+      })
+    }
+
+    if (typeof trainer !== 'string') {
+      return res.status(400).json({
+        message: 'Trainer must be a string',
       })
     }
 
     const training = await Training.create({
       title: title.trim(),
       description: description.trim(),
-      trainer: typeof trainer === 'string' ? trainer.trim() : '',
-      startDate: start,
-      endDate: end,
+      trainer: trainer.trim(),
+      startDate: dates.start,
+      endDate: dates.end,
       createdBy: req.user._id,
       enrollments: [],
     })
@@ -649,12 +886,15 @@ app.post('/api/trainings', auth, allow('hr'), async (req, res) => {
   }
 })
 
+// ENROLL IN TRAINING
 app.post('/api/trainings/:id/enroll', auth, async (req, res) => {
   try {
     const training = await Training.findById(req.params.id)
 
     if (!training) {
-      return res.status(404).json({ message: 'Training not found' })
+      return res.status(404).json({
+        message: 'Training not found',
+      })
     }
 
     const alreadyEnrolled = training.enrollments.some(
@@ -689,6 +929,7 @@ app.post('/api/trainings/:id/enroll', auth, async (req, res) => {
   }
 })
 
+// COMPLETE TRAINING
 app.patch(
   '/api/trainings/:id/complete/:userId',
   auth,
@@ -698,7 +939,9 @@ app.patch(
       const training = await Training.findById(req.params.id)
 
       if (!training) {
-        return res.status(404).json({ message: 'Training not found' })
+        return res.status(404).json({
+          message: 'Training not found',
+        })
       }
 
       const enrollment = training.enrollments.find(
@@ -730,7 +973,11 @@ app.patch(
   }
 )
 
-// Notifications — every query is scoped to the signed-in user
+// ==========================================
+// NOTIFICATIONS
+// ==========================================
+
+// GET NOTIFICATIONS
 app.get('/api/notifications', auth, async (req, res) => {
   try {
     const notifications = await Notification.find({
@@ -744,12 +991,16 @@ app.get('/api/notifications', auth, async (req, res) => {
       readAt: null,
     })
 
-    res.json({ notifications, unreadCount })
+    res.json({
+      notifications,
+      unreadCount,
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
+// MARK ONE AS READ
 app.patch('/api/notifications/:id/read', auth, async (req, res) => {
   try {
     const notification = await Notification.findOneAndUpdate(
@@ -757,8 +1008,13 @@ app.patch('/api/notifications/:id/read', auth, async (req, res) => {
         _id: req.params.id,
         userId: req.user._id,
       },
-      { $set: { readAt: new Date() } },
-      { new: true, runValidators: true }
+      {
+        $set: { readAt: new Date() },
+      },
+      {
+        new: true,
+        runValidators: true,
+      }
     )
 
     if (!notification) {
@@ -773,33 +1029,69 @@ app.patch('/api/notifications/:id/read', auth, async (req, res) => {
   }
 })
 
+// MARK ALL AS READ
 app.patch('/api/notifications/read-all', auth, async (req, res) => {
   try {
     await Notification.updateMany(
-      { userId: req.user._id, readAt: null },
-      { $set: { readAt: new Date() } }
+      {
+        userId: req.user._id,
+        readAt: null,
+      },
+      {
+        $set: { readAt: new Date() },
+      }
     )
 
-    res.json({ message: 'All notifications marked as read' })
+    res.json({
+      message: 'All notifications marked as read',
+    })
   } catch (error) {
     handleError(res, error)
   }
 })
 
-// Dashboard summary
+// ==========================================
+// DASHBOARD SUMMARY
+// ==========================================
+
 app.get('/api/dashboard/summary', auth, async (req, res) => {
   try {
     let employeeQuery
+    let pendingLeaveQuery
 
     if (req.user.role === 'hr') {
-      employeeQuery = { active: { $ne: false } }
-    } else if (req.user.role === 'manager') {
       employeeQuery = {
-        managerId: req.user._id,
         active: { $ne: false },
       }
+
+      pendingLeaveQuery = {
+        status: 'pending',
+      }
+    } else if (req.user.role === 'manager') {
+      const team = await User.find({
+        managerId: req.user._id,
+        active: { $ne: false },
+      }).select('_id')
+
+      const teamIds = team.map(user => user._id)
+
+      employeeQuery = {
+        _id: { $in: teamIds },
+      }
+
+      pendingLeaveQuery = {
+        userId: { $in: teamIds },
+        status: 'pending',
+      }
     } else {
-      employeeQuery = { _id: req.user._id }
+      employeeQuery = {
+        _id: req.user._id,
+      }
+
+      pendingLeaveQuery = {
+        userId: req.user._id,
+        status: 'pending',
+      }
     }
 
     const [
@@ -810,15 +1102,17 @@ app.get('/api/dashboard/summary', auth, async (req, res) => {
       trainingCount,
     ] = await Promise.all([
       User.countDocuments(employeeQuery),
+
       Attendance.countDocuments(
-        req.user.role === 'hr' ? {} : { userId: req.user._id }
-      ),
-      LeaveRequest.countDocuments(
         req.user.role === 'hr'
-          ? { status: 'pending' }
-          : { userId: req.user._id, status: 'pending' }
+          ? {}
+          : { userId: req.user._id }
       ),
+
+      LeaveRequest.countDocuments(pendingLeaveQuery),
+
       Announcement.countDocuments(),
+
       Training.countDocuments(),
     ])
 
@@ -836,18 +1130,29 @@ app.get('/api/dashboard/summary', auth, async (req, res) => {
   }
 })
 
+// ==========================================
+// 404 HANDLER
+// ==========================================
+
 app.use((req, res) => {
   res.status(404).json({
     message: `Route not found: ${req.method} ${req.path}`,
   })
 })
 
+// ==========================================
+// GLOBAL ERROR HANDLER
+// ==========================================
+
 app.use((error, _req, res, _next) => {
   console.error('Unhandled request error:', error)
 
   if (res.headersSent) return
 
-  res.status(500).json({ message: 'Internal server error' })
+  res.status(500).json({
+    message: 'Internal server error',
+  })
 })
 
+// ==========================================
 export default app
